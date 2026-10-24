@@ -1,16 +1,38 @@
-from contextlib import asynccontextmanager
+
+import os
+import json
 from datetime import datetime
 from pathlib import Path
-import json
-import sqlite3
+from contextlib import asynccontextmanager
 
+import psycopg
+from psycopg.rows import dict_row
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "digital_twin.db"
+load_dotenv(BASE_DIR / ".env")
+
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_PORT = os.getenv("DB_PORT", "54321")
+DB_USER = os.getenv("DB_USER", "postgres")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
+DB_NAME = os.getenv("DB_NAME", "digital_twin")
+
+
+def get_connection():
+    return psycopg.connect(
+        host=DB_HOST,
+        port=DB_PORT,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        dbname=DB_NAME,
+        row_factory=dict_row
+    )
+
 
 CAREERS = {
     "Data Analyst": {
@@ -35,34 +57,37 @@ CAREERS = {
     }
 }
 
+
 def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
+    with get_connection() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS assessments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
+                id SERIAL PRIMARY KEY,
+                name VARCHAR(80) NOT NULL,
                 target_career TEXT NOT NULL,
-                current_skills TEXT NOT NULL,
-                missing_skills TEXT NOT NULL,
+                current_skills JSONB NOT NULL,
+                missing_skills JSONB NOT NULL,
                 readiness INTEGER NOT NULL,
-                created_at TEXT NOT NULL
+                created_at TIMESTAMP NOT NULL
             )
         """)
-        conn.commit()
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
     yield
 
+
 app = FastAPI(
     title="Digital Twin Career Intelligence API",
     description="Skill-gap analysis and what-if career readiness simulator.",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan
 )
 
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
+
 
 class AssessmentRequest(BaseModel):
     name: str = Field(min_length=1, max_length=80)
@@ -70,21 +95,28 @@ class AssessmentRequest(BaseModel):
     current_skills: list[str] = Field(default_factory=list)
     planned_skills: list[str] = Field(default_factory=list)
 
+
 def normalize(items):
     return list(dict.fromkeys(s.strip() for s in items if s and s.strip()))
+
 
 def analyse(career, current_skills, planned_skills=None):
     if career not in CAREERS:
         raise HTTPException(status_code=400, detail="Please select a supported target career.")
+
     required = CAREERS[career]["skills"]
     current = normalize(current_skills)
     planned = normalize(planned_skills or [])
+
     current_lower = {s.casefold() for s in current}
     future_lower = current_lower | {s.casefold() for s in planned}
+
     missing = [s for s in required if s.casefold() not in current_lower]
     future_missing = [s for s in required if s.casefold() not in future_lower]
+
     readiness = round(100 * (len(required) - len(missing)) / len(required))
     future_readiness = round(100 * (len(required) - len(future_missing)) / len(required))
+
     return {
         "target_career": career,
         "career_description": CAREERS[career]["description"],
@@ -106,60 +138,87 @@ def analyse(career, current_skills, planned_skills=None):
         )
     }
 
+
 @app.get("/")
 def home():
     return FileResponse(BASE_DIR / "static" / "index.html")
 
+
 @app.get("/api/careers")
 def list_careers():
     return [
-        {"name": name, "description": data["description"], "required_skills": data["skills"]}
+        {
+            "name": name,
+            "description": data["description"],
+            "required_skills": data["skills"]
+        }
         for name, data in CAREERS.items()
     ]
 
+
 @app.post("/api/analyze")
 def analyze_skills(payload: AssessmentRequest):
-    result = analyse(payload.target_career, payload.current_skills, payload.planned_skills)
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.execute(
-            """INSERT INTO assessments
-            (name, target_career, current_skills, missing_skills, readiness, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)""",
+    result = analyse(
+        payload.target_career,
+        payload.current_skills,
+        payload.planned_skills
+    )
+
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            INSERT INTO assessments
+                (name, target_career, current_skills, missing_skills, readiness, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            RETURNING id
+            """,
             (
                 payload.name.strip(),
                 payload.target_career,
                 json.dumps(result["current_skills"]),
                 json.dumps(result["missing_skills"]),
                 result["readiness_score"],
-                datetime.utcnow().isoformat(timespec="seconds")
+                datetime.utcnow()
             )
-        )
-        conn.commit()
-        result["assessment_id"] = cursor.lastrowid
+        ).fetchone()
+
+        result["assessment_id"] = row["id"]
+
     return result
+
 
 @app.get("/api/assessments")
 def list_assessments():
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
+    with get_connection() as conn:
         rows = conn.execute(
-            """SELECT id, name, target_career, current_skills, missing_skills,
-                      readiness, created_at
-               FROM assessments ORDER BY id DESC LIMIT 50"""
+            """
+            SELECT id, name, target_career, current_skills, missing_skills,
+                   readiness, created_at
+            FROM assessments
+            ORDER BY id DESC
+            LIMIT 50
+            """
         ).fetchall()
+
     return [
         {
             "id": row["id"],
             "name": row["name"],
             "target_career": row["target_career"],
-            "current_skills": json.loads(row["current_skills"]),
-            "missing_skills": json.loads(row["missing_skills"]),
+            "current_skills": row["current_skills"],
+            "missing_skills": row["missing_skills"],
             "readiness_score": row["readiness"],
-            "created_at": row["created_at"]
+            "created_at": row["created_at"].isoformat()
         }
         for row in rows
     ]
 
+
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "database": "sqlite"}
+    try:
+        with get_connection() as conn:
+            conn.execute("SELECT 1")
+        return {"status": "ok", "database": "postgresql"}
+    except Exception:
+        raise HTTPException(status_code=503, detail="Database connection failed")
