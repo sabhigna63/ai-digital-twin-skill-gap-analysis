@@ -1,34 +1,6 @@
-# Python
 __pycache__/
 *.py[cod]
-*$py.class
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-
-# Virtual environments
-venv/
-.venv/
-env/
-
-# Local environment/secrets
 .env
-.env.*
-!.env.example
-
-# Local database and SQLite sidecar files
-*.db
-*.sqlite
-*.sqlite3
-*-wal
-*-shm
-
-# Editors and operating system
-.vscode/
-.idea/
-.DS_Store
-Thumbs.db
-desktop.ini
-
-# Logs
-*.log
+.venv/
+venv/
+digital_twin.db
